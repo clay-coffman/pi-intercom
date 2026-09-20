@@ -38,6 +38,9 @@ export interface IntercomConfig {
   /** Controls whether inbound broker messages may automatically trigger a model turn */
   inboundTrigger: InboundTriggerPolicy;
 
+  /** Opt-in: queue broker messages until idle, draft-free and unfocused in Herdr. */
+  inboundDelivery: "immediate" | "deferred";
+
   /** Optional custom status suffix shown after automatic lifecycle status */
   status?: string;
 
@@ -60,6 +63,7 @@ const defaults: IntercomConfig = {
   brokerArgs: ["--no-install", "tsx"],
   confirmSend: false,
   inboundTrigger: "always",
+  inboundDelivery: "immediate",
   enabled: true,
   replyHint: true,
 };
@@ -128,6 +132,13 @@ export function loadConfig(): IntercomConfig {
         throw new Error(`"inboundTrigger" must be "always", "replies", or "never"`);
       }
       config.inboundTrigger = parsedConfig.inboundTrigger;
+    }
+
+    if (Object.hasOwn(parsedConfig, "inboundDelivery")) {
+      if (parsedConfig.inboundDelivery !== "immediate" && parsedConfig.inboundDelivery !== "deferred") {
+        throw new Error(`"inboundDelivery" must be "immediate" or "deferred"`);
+      }
+      config.inboundDelivery = parsedConfig.inboundDelivery;
     }
 
     if (Object.hasOwn(parsedConfig, "replyHint")) {

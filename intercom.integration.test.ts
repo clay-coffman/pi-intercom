@@ -4349,3 +4349,116 @@ test("failed delivery from an inferred reply preserves the pending ask", { concu
     await cleanup();
   }
 });
+
+// Opt-in delivery policy: real broker, mocked Pi session; no model calls.
+test("deferred delivery holds busy sessions and drafts, then delivers FIFO without steering", { concurrency: false }, async () => {
+  const oldHerdr = process.env.HERDR_ENV;
+  process.env.HERDR_ENV = "0";
+  const { default: extension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let idle = false, draft = "unfinished human draft", pending = false;
+  const harness = createExtensionHarness("deferred-worker", {
+    hasUI: true, isIdle: () => idle,
+    ui: { getEditorText: () => draft, setStatus: () => undefined },
+  });
+  Object.assign(harness.ctx, { hasPendingMessages: () => pending });
+  try {
+    await withIntercomConfig({ inboundDelivery: "deferred" }, async () => {
+      extension(harness.pi as never); await harness.emitLifecycle("session_start");
+      const target = await waitForSessionByName(planner, "deferred-worker");
+      for (const id of ["first", "second"])
+        assert.equal((await planner.send(target.id, { messageId: id, text: id })).delivered, true);
+      await new Promise(r => setTimeout(r, 600));
+      assert.equal(harness.sentMessages.length, 0, "busy recipient must not be steered");
+      idle = true; await harness.emitLifecycle("agent_settled");
+      await new Promise(r => setTimeout(r, 600));
+      assert.equal(harness.sentMessages.length, 0, "unsent draft must stay untouched");
+      assert.equal(draft, "unfinished human draft");
+      draft = ""; pending = true;
+      await new Promise(r => setTimeout(r, 600));
+      assert.equal(harness.sentMessages.length, 0, "queued human work takes priority");
+      pending = false;
+      await new Promise(r => setTimeout(r, 700));
+      assert.equal(harness.sentMessages.length, 2);
+      assert.match(harness.sentMessages[0]!.message.content!, /first/);
+      assert.match(harness.sentMessages[1]!.message.content!, /second/);
+      assert.ok(harness.sentMessages.every(m => m.options?.deliverAs === "followUp"));
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown"); await cleanup();
+    if (oldHerdr === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = oldHerdr;
+  }
+});
+
+test("deferred messages can be cancelled before injection and are cleared on session replacement", { concurrency: false }, async () => {
+  const oldHerdr = process.env.HERDR_ENV; process.env.HERDR_ENV = "0";
+  const { default: extension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let draft = "hold", sessionId = "deferred-before";
+  const harness = createExtensionHarness("deferred-cancel", {
+    hasUI: true, sessionId: () => sessionId,
+    ui: { getEditorText: () => draft, setStatus: () => undefined },
+  });
+  try {
+    await withIntercomConfig({ inboundDelivery: "deferred" }, async () => {
+      extension(harness.pi as never); await harness.emitLifecycle("session_start");
+      const target = await waitForSessionByName(planner, "deferred-cancel");
+      await planner.send(target.id, { messageId: "cancel-queued", text: "must not arrive" });
+      await new Promise(r => setTimeout(r, 50));
+      await planner.cancelMessage("cancel-queued");
+      draft = ""; await new Promise(r => setTimeout(r, 700));
+      assert.equal(harness.sentMessages.length, 0);
+      draft = "hold";
+      await planner.send(target.id, { messageId: "old-session", text: "old session only" });
+      await new Promise(r => setTimeout(r, 50));
+      sessionId = "deferred-after"; await harness.emitLifecycle("session_start");
+      draft = ""; await new Promise(r => setTimeout(r, 700));
+      assert.equal(harness.sentMessages.length, 0, "old session queue must not reach a replacement");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown"); await cleanup();
+    if (oldHerdr === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = oldHerdr;
+  }
+});
+
+test("deferred Herdr callbacks stay held while focused or focus is unknown; explicit receive is draft-safe", { concurrency: false }, async () => {
+  const keys = ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH"] as const;
+  const old = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const root = mkdtempSync(path.join(tmpdir(), "intercom-herdr-focus-"));
+  const focusPath = path.join(root, "focus.json"), binary = path.join(root, "herdr-fixture");
+  writeFileSync(binary, `#!/bin/sh\n[ "$*" = "pane current --current" ] || exit 2\ncat '${focusPath}'\n`, { mode: 0o700 });
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: "fixture", HERDR_SOCKET_PATH: "fixture", HERDR_BIN_PATH: binary });
+  const focus = (value: boolean) => writeFileSync(focusPath, JSON.stringify({ result: { pane: { focused: value } } }));
+  focus(true);
+  const { default: extension } = await import("./index.ts");
+  const { planner, cleanup } = await setupClients();
+  let draft = "";
+  const harness = createExtensionHarness("focused-deferred", {
+    hasUI: true, ui: { getEditorText: () => draft, setStatus: () => {}, notify: () => {} },
+  });
+  try {
+    await withIntercomConfig({ inboundDelivery: "deferred" }, async () => {
+      extension(harness.pi as never); await harness.emitLifecycle("session_start");
+      const target = await waitForSessionByName(planner, "focused-deferred");
+      await planner.send(target.id, { messageId: "held-focused", text: "wait until unfocused" });
+      await new Promise(r => setTimeout(r, 650)); assert.equal(harness.sentMessages.length, 0);
+      writeFileSync(focusPath, "invalid");
+      await new Promise(r => setTimeout(r, 650)); assert.equal(harness.sentMessages.length, 0);
+      focus(false);
+      await new Promise(r => setTimeout(r, 650)); assert.equal(harness.sentMessages.length, 1);
+      focus(true); draft = "do not submit this";
+      await planner.send(target.id, { messageId: "manual-focused", text: "explicit receive" });
+      await new Promise(r => setTimeout(r, 60));
+      await harness.commands.get("intercom-receive")!("", harness.ctx);
+      assert.equal(harness.sentMessages.length, 1); assert.equal(draft, "do not submit this");
+      draft = "";
+      await harness.commands.get("intercom-receive")!("", harness.ctx);
+      assert.equal(harness.sentMessages.length, 2);
+      assert.equal(harness.sentMessages[1]?.options?.deliverAs, "followUp");
+    });
+  } finally {
+    await harness.emitLifecycle("session_shutdown"); await cleanup();
+    for (const key of keys) { if (old[key] === undefined) delete process.env[key]; else process.env[key] = old[key]; }
+    rmSync(root, { recursive: true, force: true });
+  }
+});

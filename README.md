@@ -143,6 +143,39 @@ See auth.ts:142-156.
 
 The reply hint (enabled by default) points to `intercom({ action: "reply", ... })`, so recipients do not need raw sender or `replyTo` IDs. Idle recipients get a new turn immediately; busy interactive recipients receive the message through Pi's steering queue at the next safe model boundary without aborting the active turn. Attachment content is included in the agent-visible body, and messages are rendered inline and stored in Pi session history.
 
+### Optional deferred delivery for human-facing sessions
+
+Set `"inboundDelivery": "deferred"` in Intercom's `config.json` to hold broker
+messages instead of steering a busy recipient. The default remains
+`"immediate"` for compatibility.
+
+Deferred messages wait until Pi is idle, has no queued input, and its editor
+is completely empty. In Herdr they also wait while the recipient pane is
+focused; an unavailable or ambiguous focus query keeps them held. Intercom
+queries Herdr through its CLI but never writes text or Enter into the pane.
+The final injection uses Pi's native follow-up path and rechecks the local
+idle/editor state after the asynchronous focus query.
+
+The status footer and `intercom({ action: "status" })` show held callbacks.
+`/intercom-receive` explicitly releases them while focused, but still refuses
+while busy, while user messages are pending, or while a draft is present.
+Ordinary replies to an outstanding `ask` still resolve that waiter directly;
+otherwise deferred delivery must not inject a message into an active turn.
+
+The pending queue is bounded to 256 messages and belongs to this Pi runtime;
+it is **not a durable task queue**. Overflow produces an `expired` receipt.
+Cancellation/supersession removes a held message before injection. Reload,
+exit, or session replacement clears held messages rather than delivering them
+to a new conversation. Keep reports and decisions in their normal durable
+files and reconcile outstanding assignments on restart. Receipts and message
+injection are not acknowledgement that the lead completed the requested work.
+
+This mode adds no agent launcher, scheduler, or task database. Keep optional
+`openProjectPaneIfMissing` off when Herdr's existing workflow owns agent
+creation. `inboundTrigger` still decides whether a delivered message starts a
+turn; `never` retains no-auto-trigger behavior. The deferred policy applies
+to broker messages, not the separate in-process subagent bridge.
+
 ## Workflow: Planner-Worker Coordination
 
 The most natural use of pi-intercom is splitting a task between two sessions — one holds the big picture, the other does the hands-on work. When the worker hits an ambiguity ("should I optimize for readability or performance here?"), they ask without losing context.
@@ -423,6 +456,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
+| `inboundDelivery` | `"immediate"` | `"deferred"` holds callbacks until idle, draft-free and (inside Herdr) unfocused; `/intercom-receive` explicitly releases focused delivery. Runtime-only queue; reconcile reports after restart. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |

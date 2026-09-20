@@ -102,3 +102,17 @@ test("loadConfig rejects invalid inboundTrigger values", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("deferred inbound delivery is opt-in and rejects invalid modes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-intercom-delivery-config-"));
+  try {
+    await withAgentDir(root, () => {
+      assert.equal(loadConfig().inboundDelivery, "immediate");
+      mkdirSync(join(root, "intercom"), { recursive: true });
+      writeFileSync(getConfigPath(), JSON.stringify({ inboundDelivery: "deferred" }));
+      assert.equal(loadConfig().inboundDelivery, "deferred");
+      writeFileSync(getConfigPath(), JSON.stringify({ inboundDelivery: "sometimes" }));
+      assert.throws(() => loadConfig(), /inboundDelivery/);
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -9,6 +9,7 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
+import { readHerdrFocus, recipientReady } from "./deferred-delivery.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -613,6 +614,68 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const latestOutboundReceipts = new Map<string, { status: MessageReceiptStatus; timestamp: number; detail?: string }>();
   const outboxRequestIds = new Set<string>();
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
+  const deferredInbound = new Map<string, InboundMessageEntry>();
+  let deferredTimer: ReturnType<typeof setTimeout> | null = null;
+  let deferredFlushing = false;
+
+  function showDeferredCount(): void {
+    const ctx = getLiveContext();
+    if (ctx?.hasUI) ctx.ui?.setStatus?.("intercom-pending", deferredInbound.size
+      ? `Intercom: ${deferredInbound.size} held · /intercom-receive` : undefined);
+  }
+  function clearDeferred(): void {
+    if (deferredTimer) clearTimeout(deferredTimer);
+    deferredTimer = null;
+    deferredInbound.clear();
+    deferredFlushing = false;
+    showDeferredCount();
+  }
+  function scheduleDeferred(): void {
+    if (deferredTimer || deferredFlushing || !deferredInbound.size || !getLiveContext()) return;
+    const generation = runtimeGeneration;
+    deferredTimer = setTimeout(() => {
+      deferredTimer = null;
+      void flushDeferred(false, generation);
+    }, 500);
+    deferredTimer.unref?.();
+  }
+  async function flushDeferred(manual = false, generation = runtimeGeneration): Promise<void> {
+    if (deferredFlushing || !deferredInbound.size) return;
+    const ctx = getLiveContext(runtimeContext, generation);
+    if (!ctx || !recipientReady(ctx)) { scheduleDeferred(); return; }
+    deferredFlushing = true;
+    try {
+      // Herdr focus is only a display hint. Never type through the PTY, even
+      // after this check. An explicit command may release a focused session.
+      if (!manual && process.env.HERDR_ENV === "1" && await readHerdrFocus() !== false) return;
+      if (!getLiveContext(ctx, generation) || !recipientReady(ctx)) return;
+      for (const [key, entry] of deferredInbound) {
+        if (!getLiveContext(ctx, generation) || !recipientReady(ctx)) break;
+        sendIncomingMessage(entry, "deferred", generation);
+        deferredInbound.delete(key);
+      }
+    } catch (error) {
+      if (getLiveContext(ctx, generation)) notifyIfLive(ctx, `Intercom delivery held: ${getErrorMessage(error)}`, "warning", generation);
+    } finally {
+      if (generation === runtimeGeneration) {
+        deferredFlushing = false;
+        showDeferredCount();
+        scheduleDeferred();
+      }
+    }
+  }
+  function queueDeferred(entry: InboundMessageEntry): void {
+    if (deferredInbound.size >= 256) {
+      emitMessageReceipt(entry.message.id, "expired", "Receiver callback queue is full; reconcile task reports");
+      const ctx = getLiveContext();
+      if (ctx) notifyIfLive(ctx, "Intercom queue full; check outstanding task reports.", "warning");
+      return;
+    }
+    deferredInbound.set(`${entry.from.id}\0${entry.message.id}`, entry);
+    emitMessageReceipt(entry.message.id, "queued", "Held until recipient is idle, draft-free and not focused");
+    showDeferredCount();
+    scheduleDeferred();
+  }
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
   }
@@ -646,10 +709,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // Receipts are diagnostics; message handling should not fail when the sender disconnects.
     }
   }
-  function handleMessageControl(control: MessageControl): void {
+  function handleMessageControl(control: MessageControl, from: SessionInfo): void {
+    const removed = deferredInbound.delete(`${from.id}\0${control.messageId}`);
+    showDeferredCount();
     replyTracker.dismissPendingAsk(control.messageId);
     if (control.action === "cancel") {
-      emitMessageReceipt(control.messageId, "cancellation_requested", "message may already be injected or processed");
+      emitMessageReceipt(control.messageId, removed ? "cancelled" : "cancellation_requested", removed ? "Removed before injection" : "message may already be injected or processed");
       return;
     }
     emitMessageReceipt(control.messageId, "superseded", control.supersededBy ? `superseded by ${control.supersededBy}` : undefined);
@@ -1174,7 +1239,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return false;
   }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "deferred", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
     }
@@ -1195,9 +1260,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         display: true,
         details: deliveredEntry,
       },
-      delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
-        ? { triggerTurn: true }
-        : { deliverAs: "steer" }
+      delivery === "deferred"
+        ? { deliverAs: "followUp", triggerTurn: shouldTriggerInboundMessage(entry, forceTrigger) }
+        : delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
+          ? { triggerTurn: true }
+          : { deliverAs: "steer" }
     );
   }
   function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
@@ -1237,6 +1304,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
+    if (config.inboundDelivery === "deferred") {
+      queueDeferred(entry);
+      return;
+    }
     void (async () => {
       const activeContext = getLiveContext(liveContext, messageGeneration);
       if (!activeContext) {
@@ -1327,7 +1398,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           });
           break;
         case "message_control":
-          handleMessageControl(message.control);
+          handleMessageControl(message.control, message.from);
           break;
         case "session_joined":
           for (const namespace of localExtensions.keys()) {
@@ -1551,6 +1622,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     });
   }
   function startSessionRuntime(ctx: ExtensionContext): void {
+    clearDeferred();
     const previousClient = client;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session replaced");
     shuttingDown = false;
@@ -1704,6 +1776,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     unsubscribeSubagentControlIntercom();
     unsubscribeSubagentResultIntercom();
     unsubscribeOutboxRequest();
+    clearDeferred();
     shuttingDown = true;
     disposed = true;
     failPendingOutboxRequests(runtimeGeneration, "session_ended", "Session shutting down");
@@ -1724,6 +1797,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentSessionId = null;
     currentIntercomSessionId = null;
     sessionStartedAt = null;
+  });
+  pi.on("agent_settled", () => { scheduleDeferred(); });
+  pi.registerCommand("intercom-receive", {
+    description: "Release held Intercom callbacks when idle and draft-free",
+    handler: async (_args, ctx) => {
+      await flushDeferred(true);
+      if (getLiveContext(ctx)) notifyIfLive(ctx, deferredInbound.size
+        ? `${deferredInbound.size} callback(s) still held; finish pending work and clear the draft first.`
+        : "No held Intercom callbacks.", "info");
+    },
   });
   pi.on("turn_end", () => {
     if (!getLiveContext()) {
@@ -2592,9 +2675,9 @@ Usage:
             return {
               content: [{
                 type: "text",
-                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}\nHeld callbacks: ${deferredInbound.size}`,
               }],
-              details: {},
+              details: { heldCallbacks: deferredInbound.size },
             };
           } catch (error) {
             return {
