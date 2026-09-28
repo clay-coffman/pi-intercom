@@ -4,6 +4,10 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Changed
+- Deferred inbound delivery now holds a message only for signs of a human at the keyboard: a draft in the editor, queued user input, or (inside Herdr) a focused pane. A recipient that is merely mid-turn, with none of those, is reached through Pi's steer queue at the next tool boundary instead of waiting for the turn to end. Idle recipients still receive follow-ups. `/intercom-receive` still overrides focus only and never steers a working turn.
+- The Herdr focus query retries up to three times before treating focus as unknown, and focus holds poll at 1.5 s instead of 0.5 s to limit CLI spawns. The footer and `/intercom-receive` name the hold reason (`draft`, `queued input`, `focused`, `focus unknown`, `busy`).
+
 ## [0.13.0] - 2026-09-02
 
 ### Highlights

@@ -145,22 +145,28 @@ The reply hint (enabled by default) points to `intercom({ action: "reply", ... }
 
 ### Optional deferred delivery for human-facing sessions
 
-Set `"inboundDelivery": "deferred"` in Intercom's `config.json` to hold broker
-messages instead of steering a busy recipient. The default remains
+Set `"inboundDelivery": "deferred"` in Intercom's `config.json` to keep broker
+messages out of a conversation a human is having. The default remains
 `"immediate"` for compatibility.
 
-Deferred messages wait until Pi is idle, has no queued input, and its editor
-is completely empty. In Herdr they also wait while the recipient pane is
-focused; an unavailable or ambiguous focus query keeps them held. Intercom
-queries Herdr through its CLI but never writes text or Enter into the pane.
-The final injection uses Pi's native follow-up path and rechecks the local
-idle/editor state after the asynchronous focus query.
+Deferred messages are held for signs of a human at the keyboard: queued user
+input, a non-empty editor, or (in Herdr) a focused recipient pane. An
+unavailable or ambiguous focus query is retried a few times and then keeps
+them held. Intercom queries Herdr through its CLI but never writes text or
+Enter into the pane. Once no human hold applies, an idle recipient receives
+the messages through Pi's follow-up path, and a recipient that is mid-turn
+receives them through Pi's steer queue at its next tool boundary, without
+aborting the turn. Being busy is therefore not by itself a reason to hold; a
+working agent in a pane nobody is looking at stays reachable. The local
+idle/editor state is rechecked after the asynchronous focus query and before
+each injection.
 
-The status footer and `intercom({ action: "status" })` show held callbacks.
+The status footer and `intercom({ action: "status" })` show held callbacks and
+the current hold reason (`draft`, `queued input`, `focused`, `focus unknown`).
 `/intercom-receive` explicitly releases them while focused, but still refuses
-while busy, while user messages are pending, or while a draft is present.
-Ordinary replies to an outstanding `ask` still resolve that waiter directly;
-otherwise deferred delivery must not inject a message into an active turn.
+while busy, while user messages are pending, or while a draft is present; the
+manual release never steers a working turn. Ordinary replies to an outstanding
+`ask` still resolve that waiter directly.
 
 The pending queue is bounded to 256 messages and belongs to this Pi runtime;
 it is **not a durable task queue**. Overflow produces an `expired` receipt.
@@ -456,7 +462,7 @@ Create `~/.pi/agent/intercom/config.json`:
 | `brokerArgs` | `["--no-install", "tsx"]` | Advanced trusted arguments passed to custom `brokerCommand` before the broker script path |
 | `confirmSend` | false | Show a confirmation dialog before ordinary or inferred sends from an interactive session with UI; caller-supplied `replyTo` skips it |
 | `inboundTrigger` | `"always"` | Auto-trigger policy for inbound broker messages: `"always"`, `"replies"`, or `"never"`. Local in-process subagent relay events still trigger the addressed session. |
-| `inboundDelivery` | `"immediate"` | `"deferred"` holds callbacks until idle, draft-free and (inside Herdr) unfocused; `/intercom-receive` explicitly releases focused delivery. Runtime-only queue; reconcile reports after restart. |
+| `inboundDelivery` | `"immediate"` | `"deferred"` holds callbacks while the recipient has a draft, queued user input, or (inside Herdr) a focused pane; otherwise a busy recipient is steered and an idle one gets a follow-up. `/intercom-receive` explicitly releases focused delivery when idle. Runtime-only queue; reconcile reports after restart. |
 | `enabled` | true | Enable/disable intercom entirely |
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |

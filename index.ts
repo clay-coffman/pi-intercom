@@ -9,7 +9,7 @@ import { SessionListOverlay } from "./ui/session-list.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
 import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
-import { readHerdrFocus, recipientReady } from "./deferred-delivery.ts";
+import { deferredDeliveryMode, humanHoldReason, readHerdrFocusWithRetry, recipientReady } from "./deferred-delivery.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -617,48 +617,78 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const deferredInbound = new Map<string, InboundMessageEntry>();
   let deferredTimer: ReturnType<typeof setTimeout> | null = null;
   let deferredFlushing = false;
+  type DeferredHold = "draft" | "pending" | "unavailable" | "focused" | "focus-unknown" | "busy";
+  let deferredHold: DeferredHold | undefined;
+  const DEFERRED_HOLD_LABEL: Record<DeferredHold, string> = {
+    draft: "draft", pending: "queued input", unavailable: "unavailable",
+    focused: "focused", "focus-unknown": "focus unknown", busy: "busy",
+  };
 
   function showDeferredCount(): void {
     const ctx = getLiveContext();
-    if (ctx?.hasUI) ctx.ui?.setStatus?.("intercom-pending", deferredInbound.size
-      ? `Intercom: ${deferredInbound.size} held · /intercom-receive` : undefined);
+    if (!ctx?.hasUI) return;
+    const reason = deferredHold ? ` (${DEFERRED_HOLD_LABEL[deferredHold]})` : "";
+    ctx.ui?.setStatus?.("intercom-pending", deferredInbound.size
+      ? `Intercom: ${deferredInbound.size} held${reason} · /intercom-receive` : undefined);
   }
   function clearDeferred(): void {
     if (deferredTimer) clearTimeout(deferredTimer);
     deferredTimer = null;
     deferredInbound.clear();
     deferredFlushing = false;
+    deferredHold = undefined;
     showDeferredCount();
   }
   function scheduleDeferred(): void {
     if (deferredTimer || deferredFlushing || !deferredInbound.size || !getLiveContext()) return;
     const generation = runtimeGeneration;
+    // Focus holds cost a CLI spawn per attempt, so poll them less often.
+    const delay = deferredHold === "focused" || deferredHold === "focus-unknown" ? 1500 : 500;
     deferredTimer = setTimeout(() => {
       deferredTimer = null;
       void flushDeferred(false, generation);
-    }, 500);
+    }, delay);
     deferredTimer.unref?.();
   }
+  /**
+   * Deliver held messages. Human presence (draft, queued input, Herdr focus)
+   * holds. A busy recipient nobody is looking at is reached through Pi's steer
+   * queue at the next tool boundary; an idle one gets a follow-up. Manual
+   * release (`/intercom-receive`) overrides focus only and never steers.
+   */
   async function flushDeferred(manual = false, generation = runtimeGeneration): Promise<void> {
     if (deferredFlushing || !deferredInbound.size) return;
     const ctx = getLiveContext(runtimeContext, generation);
-    if (!ctx || !recipientReady(ctx)) { scheduleDeferred(); return; }
+    if (!ctx) { scheduleDeferred(); return; }
+    const hold = humanHoldReason(ctx);
+    if (hold) { deferredHold = hold; showDeferredCount(); scheduleDeferred(); return; }
+    if (manual && !recipientReady(ctx)) { deferredHold = "busy"; showDeferredCount(); scheduleDeferred(); return; }
     deferredFlushing = true;
     try {
       // Herdr focus is only a display hint. Never type through the PTY, even
       // after this check. An explicit command may release a focused session.
-      if (!manual && process.env.HERDR_ENV === "1" && await readHerdrFocus() !== false) return;
-      if (!getLiveContext(ctx, generation) || !recipientReady(ctx)) return;
+      if (!manual && process.env.HERDR_ENV === "1") {
+        const focused = await readHerdrFocusWithRetry();
+        if (focused !== false) { deferredHold = focused === true ? "focused" : "focus-unknown"; return; }
+      }
+      if (!getLiveContext(ctx, generation)) return;
       for (const [key, entry] of deferredInbound) {
-        if (!getLiveContext(ctx, generation) || !recipientReady(ctx)) break;
-        sendIncomingMessage(entry, "deferred", generation);
+        if (!getLiveContext(ctx, generation)) break;
+        // Recheck after the async focus read and after each injection.
+        const recheck = humanHoldReason(ctx);
+        if (recheck) { deferredHold = recheck; break; }
+        const mode = deferredDeliveryMode(ctx);
+        if (!mode || (manual && mode !== "followUp")) { deferredHold = mode ? "busy" : "unavailable"; break; }
+        sendIncomingMessage(entry, mode === "steer" ? "deferredSteer" : "deferred", generation);
         deferredInbound.delete(key);
+        deferredHold = undefined;
       }
     } catch (error) {
       if (getLiveContext(ctx, generation)) notifyIfLive(ctx, `Intercom delivery held: ${getErrorMessage(error)}`, "warning", generation);
     } finally {
       if (generation === runtimeGeneration) {
         deferredFlushing = false;
+        if (!deferredInbound.size) deferredHold = undefined;
         showDeferredCount();
         scheduleDeferred();
       }
@@ -672,7 +702,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     deferredInbound.set(`${entry.from.id}\0${entry.message.id}`, entry);
-    emitMessageReceipt(entry.message.id, "queued", "Held until recipient is idle, draft-free and not focused");
+    emitMessageReceipt(entry.message.id, "queued", "Held while recipient is focused or has a draft; steered when busy, followed up when idle");
     showDeferredCount();
     scheduleDeferred();
   }
@@ -1239,7 +1269,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     return false;
   }
-  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "deferred", generation = runtimeGeneration, forceTrigger = false): void {
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer" | "deferred" | "deferredSteer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
       return;
     }
@@ -1262,6 +1292,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       },
       delivery === "deferred"
         ? { deliverAs: "followUp", triggerTurn: shouldTriggerInboundMessage(entry, forceTrigger) }
+        : delivery === "deferredSteer"
+          // Steer lands at the next tool boundary of the active turn. triggerTurn
+          // keeps the message from being appended silently if the turn ended
+          // between the readiness check and this call.
+          ? { deliverAs: "steer", triggerTurn: shouldTriggerInboundMessage(entry, forceTrigger) }
         : delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
           ? { triggerTurn: true }
           : { deliverAs: "steer" }
@@ -1800,11 +1835,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   });
   pi.on("agent_settled", () => { scheduleDeferred(); });
   pi.registerCommand("intercom-receive", {
-    description: "Release held Intercom callbacks when idle and draft-free",
+    description: "Release held Intercom callbacks in a focused pane when idle and draft-free",
     handler: async (_args, ctx) => {
       await flushDeferred(true);
       if (getLiveContext(ctx)) notifyIfLive(ctx, deferredInbound.size
-        ? `${deferredInbound.size} callback(s) still held; finish pending work and clear the draft first.`
+        ? `${deferredInbound.size} callback(s) still held${deferredHold ? ` (${DEFERRED_HOLD_LABEL[deferredHold]})` : ""}; finish pending work and clear the draft first.`
         : "No held Intercom callbacks.", "info");
     },
   });
